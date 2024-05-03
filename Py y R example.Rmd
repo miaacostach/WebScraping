@@ -1,0 +1,172 @@
+---
+title: "Scraping Py and plots with R"
+author: "M.Acosta"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+
+```{r message=F, warning=F}
+# R libraries
+library(reticulate)
+library(tidyverse)
+library(forcats)
+```
+
+```{python}
+# Py modules 
+import pandas as pd
+import requests
+from io import StringIO 
+```
+
+
+```{python}
+url = "https://fbref.com/en/comps/9/keepers/Premier-League-Stats"
+
+# Send a GET request and remove the comment tags from response text
+stripped_comment_tags = StringIO(requests.get(url).text.replace('<!--', '').replace('-->', ''))
+
+df1 = pd.read_html(stripped_comment_tags, attrs={'id': 'stats_squads_keeper_for'})[0]
+df2 = pd.read_html(stripped_comment_tags, attrs={'id': 'stats_keeper'})[0]
+
+```
+
+```{python}
+# Print data frames Py
+print(df1)
+print(df2)
+```
+
+```{r}
+# Transform Py into R objects
+rdf1 <- py$df1
+rdf2 <- py$df2
+
+rdf1 <- rdf1 %>%
+  setNames(names(.) %>%
+             gsub(pattern = "['() ]", replacement = "", .) %>%  # Elimina paréntesis y comillas
+             gsub(pattern = ",", replacement = "_")) 
+
+
+names(rdf1)[1] <- 'Squad'
+names(rdf1)[7] <- 'GA'
+names(rdf1)[12] <- 'Wins'
+
+rdf1 |> ggplot(aes(fct_reorder(Squad,-GA),y=GA)) +
+  geom_col() +
+  scale_y_continuous(limits = c(0,max(rdf1$GA)+5)) +
+   geom_text(aes(label= GA),vjust = -0.2) +
+  theme_minimal() +
+   theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1,size = 9)) +
+  labs(title = 'Teams 2023-2024 Premier League',
+       x='Squad',
+       y='Goals Agains')
+
+```
+
+
+```{r}
+rdf1 |> ggplot(aes(fct_reorder(Squad,-Wins),y=Wins)) +
+  geom_col() +
+  scale_y_continuous(limits = c(0,max(rdf1$Wins)+3)) +
+   geom_text(aes(label= Wins),vjust = -0.2) +
+  theme_minimal() +
+   theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1,size = 9)) +
+  labs(title = 'Wins 2023-2024 Premier League',
+       x='Squad',
+       y='Wins')
+```
+
+
+```{r}
+names(rdf2)
+
+rdf2 <- rdf2 %>%
+  setNames(names(.) %>%
+             gsub(pattern = "['() ]", replacement = "", .) %>%  # Elimina paréntesis y comillas
+             gsub(pattern = ",", replacement = "_")) 
+
+names(rdf2)[1] <- 'RK'
+names(rdf2)[2] <- 'Player'
+names(rdf2)[3] <- 'Nation'
+names(rdf2)[5] <- 'Squad'
+names(rdf2)[7] <- 'Born'
+names(rdf2)[8] <- 'MP'
+names(rdf2)[17] <- 'Wins'
+
+
+rdf2 <- rdf2 |> 
+  mutate(MP=as.numeric(MP)) |> 
+  mutate(Wins=as.numeric(Wins))
+
+
+```
+
+```{r}
+rdf2 |> mutate(Wins=case_when(is.na(Wins) ~ 0, 
+                              TRUE~Wins)) |> 
+  ggplot(aes(fct_reorder(Player,-Wins),y=Wins)) +
+  geom_col() +
+  scale_y_continuous(limits = c(0,23)) +
+   geom_text(aes(label= Wins),vjust = -0.2) +
+  theme_minimal() +
+   theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1,size = 9)) +
+  labs(title = 'Players wins 2023-2024 Premier League',
+       x='Players',
+       y='Wins')
+
+```
+```{r, fig.height=10, fig.width=8}
+rdf2 |> mutate(Wins=case_when(is.na(Wins) ~ 0, 
+                              TRUE~Wins)) |>
+  filter(Squad %in% c('Crystal Palace',
+                 'Newcastle Utd',
+                 "Nott'ham Forest",
+                 'Arsenal',
+                 'Aston Villa',
+                 'Bournemouth',
+                 'Brentford',
+                 'Brighton')) |> 
+  ggplot(aes(fct_reorder(Player,-Wins),y=Wins)) +
+  geom_col() +
+  scale_y_continuous(limits = c(0,23)) +
+   geom_text(aes(label= Wins),vjust = -0.2) +
+  theme_minimal() +
+  facet_wrap(~Squad, scales='free') +
+   theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1,size = 9)) +
+  labs(title = 'Players wins 2023-2024 Premier League',
+       x='Players',
+       y='Wins')
+```
+
+```{r eval=FALSE, include=FALSE}
+rdf2 |> mutate(Wins=case_when(is.na(Wins) ~ 0, 
+                              TRUE~Wins)) |>
+  count(Squad) |> 
+  arrange(-n)
+```
+
+
+```{r, }
+rdf2 |> mutate(Wins=case_when(is.na(Wins) ~ 0, 
+                              TRUE~Wins)) |> 
+  group_by(Squad) |> 
+  summarise(Wins = sum(Wins)) |> 
+  ggplot(aes(fct_reorder(Squad,-Wins),y=Wins)) +
+  geom_col() +
+  scale_y_continuous(limits = c(0,25)) +
+   geom_text(aes(label= Wins),vjust = -0.2) +
+  theme_minimal() +
+   theme(axis.text.x = element_text(angle = 90, vjust = 0.5, hjust=1,size = 9)) +
+  labs(title = 'Squad wins 2023-2024 Premier League',
+       x='Squad',
+       y='Wins')
+
+```
+
+```{r}
+# Interesting links
+# https://medium.com/data-science-at-microsoft/collaborating-between-python-and-r-using-reticulate-25246b367957
+```
+
