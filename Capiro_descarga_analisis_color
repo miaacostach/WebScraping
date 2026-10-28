@@ -1,0 +1,370 @@
+"""Capiro: catalog download and color analysis for Positron.
+
+Install in the terminal for the selected Python interpreter:
+python -m pip install requests beautifulsoup4 pillow numpy pandas
+python -m pip install scikit-learn scikit-image opencv-python-headless
+
+Change CARPETA_SALIDA and run the entire file.
+PAGINAS=None follows pagination links; [1, 2] limits the query.
+Colors describe the published image, without photographic calibration.
+The mask represents the visible object (which may include stems and leaves).
+To use a corrected mask, save a black-and-white PNG with the same dimensions
+as the original in mascaras_manuales/<imagen_id>.png and run the script again.
+"""
+from pathlib import Path
+from urllib.parse import urljoin, urlparse, urldefrag
+from datetime import datetime, timezone
+import hashlib
+import json
+import re
+import time
+import unicodedata
+import math
+from io import BytesIO
+
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from bs4 import BeautifulSoup
+from PIL import Image, ImageOps, ExifTags, ImageDraw, ImageCms
+import numpy as np
+import pandas as pd
+import cv2
+from sklearn.cluster import MiniBatchKMeans
+from skimage.color import rgb2lab
+
+# ================= CONFIGURACIÓN PARA POSITRON =================
+CARPETA_SALIDA = Path(r"D:\R\Capiro_resultados")   # set the workspace
+URL_CATALOGO = "https://www.capiro.co/es/flores/"  # Public link of flowers
+PAGINAS = None                 # None = todas; ejemplo: [1, 2, 3]
+LIMITE_PRODUCTOS = None        # Para probar: 3; None = todos
+DESCARGAR_TODAS_LAS_FOTOS = True  # False = primera foto de cada ficha
+ANALIZAR_COLOR = True
+K_COLORES = 5
+MAX_LADO_ANALISIS = 1400
+MAX_PIXELES_ENTRENAMIENTO = 30000
+PAUSA_SEGUNDOS = 0.6
+TIMEOUT = (15, 60)
+SEMILLA = 42
+# No se elimina verde automáticamente: existen flores verdes.
+# ==============================================================
+
+
+def session():
+    s = requests.Session()
+    retry = Retry(total=3, backoff_factor=1,
+                  status_forcelist=[429, 500, 502, 503, 504],
+                  allowed_methods=["GET"], respect_retry_after_header=True)
+    s.mount("https://", HTTPAdapter(max_retries=retry))
+    s.headers.update({"User-Agent": "CapiroResearchDownloader/1.0",
+                      "Accept-Language": "es"})
+    return s
+
+
+def clean_url(url):
+    return urldefrag(url)[0]
+
+
+def slug(text):
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode()
+    return re.sub(r"[^a-zA-Z0-9_-]+", "_", text).strip("_")[:70] or "flor"
+
+
+def save_csv(rows, path):
+    if rows:
+        tmp = path.with_suffix(".tmp")
+        pd.DataFrame(rows).to_csv(tmp, index=False, encoding="utf-8-sig")
+        tmp.replace(path)
+
+
+def get_html(s, url):
+    response = s.get(url, timeout=TIMEOUT)
+    response.raise_for_status()
+    time.sleep(PAUSA_SEGUNDOS)
+    return BeautifulSoup(response.content, "html.parser"), response.url
+
+
+def fields(root):
+    result = {}
+    for p in root.select("p"):
+        text = p.get_text(" ", strip=True)
+        if ":" in text:
+            key, value = text.split(":", 1)
+            result[key.strip()] = value.strip()
+    return result
+
+
+def src(img, page):
+    value = img.get("data-src") or img.get("src") or ""
+    return urljoin(page, value) if value and not value.startswith("data:") else ""
+
+
+def discover(s, errors):
+    explicit = PAGINAS is not None
+    queue = ([URL_CATALOGO if int(n) == 1 else
+              urljoin(URL_CATALOGO, f"page/{int(n)}/") for n in PAGINAS]
+             if explicit else [URL_CATALOGO])
+    visited, products, known_products = set(), [], set()
+    signatures = set()
+    while queue:
+        url = clean_url(queue.pop(0))
+        if url in visited:
+            continue
+        visited.add(url)
+        print("Consultando catálogo:", url)
+        try:
+            soup, actual = get_html(s, url)
+            cards = soup.select("#content_product article.item_post")
+            if not cards:
+                raise ValueError("No se encontraron tarjetas; revisar URL o estructura HTML.")
+            signature = tuple(c.get("id", "") for c in cards)
+            if signature in signatures:
+                raise ValueError("Página repetida: el servidor devolvió productos ya consultados.")
+            signatures.add(signature)
+            for card in cards:
+                a = card.find_parent("a", href=True)
+                title = card.select_one("h6, h5, h3")
+                if not a or not title:
+                    continue
+                link = clean_url(urljoin(actual, a["href"]))
+                if link in known_products:
+                    continue
+                known_products.add(link)
+                f = fields(card)
+                products.append({"producto_id": card.get("id", ""),
+                                 "nombre": title.get_text(" ", strip=True),
+                                 "categoria": f.get("Categoría", ""),
+                                 "obtentor": f.get("Breeder", ""),
+                                 "producto_url": link, "pagina_catalogo": url})
+            if not explicit:
+                for a in soup.select("#pagination a[href]"):
+                    link = clean_url(urljoin(actual, a["href"]))
+                    if link.startswith(URL_CATALOGO) and link not in visited and link not in queue:
+                        queue.append(link)
+        except Exception as e:
+            errors.append({"etapa": "catalogo", "url": url, "error": str(e)})
+            print("  ERROR:", e)
+    return products[:LIMITE_PRODUCTOS] if LIMITE_PRODUCTOS else products
+
+
+def detail(s, product):
+    soup, actual = get_html(s, product["producto_url"])
+    info = soup.select_one("#info_detail")
+    if not info:
+        raise ValueError("No se encontró #info_detail en la ficha.")
+    f = fields(info)
+    colors = [i.get("title") or i.get("alt", "")
+              for i in info.select(".color_atribute img")]
+    images = []
+    for img in soup.select("#slider_product img"):
+        url = src(img, actual)
+        if url and url not in images:
+            images.append(url)
+    if not images:
+        raise ValueError("La ficha no contiene imágenes en #slider_product.")
+    p = dict(product)
+    p.update({"categoria": f.get("Categoría", product["categoria"]),
+              "obtentor": f.get("Breeder", product["obtentor"]),
+              "color_catalogo": "; ".join(dict.fromkeys(colors)),
+              "campos_ficha_json": json.dumps(f, ensure_ascii=False),
+              "consulta_utc": datetime.now(timezone.utc).isoformat()})
+    return p, images if DESCARGAR_TODAS_LAS_FOTOS else images[:1]
+
+
+def download(s, url, stem, folder):
+    ext = Path(urlparse(url).path).suffix.lower()
+    if ext not in [".png", ".jpg", ".jpeg", ".webp", ".tif", ".tiff"]:
+        ext = ".img"
+    path = folder / (stem + ext)
+    status = "EXISTENTE" if path.exists() else "DESCARGADA"
+    if not path.exists():
+        r = s.get(url, timeout=TIMEOUT)
+        r.raise_for_status()
+        with Image.open(BytesIO(r.content)) as im:
+            im.verify()
+        tmp = path.with_suffix(path.suffix + ".part")
+        tmp.write_bytes(r.content)
+        tmp.replace(path)
+        time.sleep(PAUSA_SEGUNDOS)
+    with Image.open(path) as im:
+        im.load()
+        exif = {ExifTags.TAGS.get(k, str(k)): str(v) for k, v in im.getexif().items()}
+        metadata = {"ancho_original": im.width, "alto_original": im.height,
+                    "modo_original": im.mode, "formato": im.format,
+                    "perfil_icc_presente": bool(im.info.get("icc_profile")),
+                    "dpi_json": json.dumps(im.info.get("dpi")),
+                    "exif_json": json.dumps(exif, ensure_ascii=False)}
+    metadata.update({"archivo": str(path.resolve()), "estado_descarga": status,
+                     "bytes": path.stat().st_size,
+                     "sha256": hashlib.sha256(path.read_bytes()).hexdigest()})
+    return path, metadata
+
+
+def load_mask(path, image_id, dirs):
+    with Image.open(path) as im:
+        im = ImageOps.exif_transpose(im)
+        alpha_image = im.convert('RGBA').getchannel('A')
+        if im.info.get('icc_profile'):
+            profile = ImageCms.ImageCmsProfile(BytesIO(im.info['icc_profile']))
+            srgb = ImageCms.createProfile('sRGB')
+            converted = ImageCms.profileToProfile(im.convert('RGB'), profile, srgb, outputMode='RGB')
+            converted.putalpha(alpha_image)
+            rgba = np.array(converted)
+        else:
+            rgba = np.array(im.convert('RGBA'))
+    rgb, alpha = rgba[:, :, :3], rgba[:, :, 3]
+    manual = dirs["mascaras_manuales"] / (image_id + ".png")
+    if manual.exists():
+        mask = np.array(Image.open(manual).convert("L")) > 127
+        if mask.shape != alpha.shape:
+            raise ValueError("Máscara manual y original tienen tamaños diferentes.")
+        method, review = "manual", "MANUAL"
+    elif np.any(alpha < 250):
+        mask = alpha > 127
+        method, review = "canal_alpha", "REVISAR_OBJETO"
+    else:
+        # Quitar SOLO fondo uniforme conectado al borde, no todo lo blanco.
+        border = np.concatenate([rgb[0], rgb[-1], rgb[:, 0], rgb[:, -1]])
+        background = np.median(border, axis=0)
+        if np.mean(np.linalg.norm(border.astype(float) - background, axis=1) < 20) < .8:
+            raise ValueError("Fondo no uniforme: crear máscara manual antes de analizar.")
+        close = (np.linalg.norm(rgb.astype(float) - background, axis=2) < 18).astype('uint8')
+        _, labels = cv2.connectedComponents(close)
+        edge_labels = np.unique(np.concatenate([labels[0], labels[-1], labels[:, 0], labels[:, -1]]))
+        edge_labels = edge_labels[edge_labels != 0]
+        mask = ~np.isin(labels, edge_labels)
+        method, review = "fondo_uniforme_conectado_borde", "REVISAR_FONDO"
+    scale = min(1., MAX_LADO_ANALISIS / max(rgb.shape[:2]))
+    if scale < 1:
+        size = (round(rgb.shape[1] * scale), round(rgb.shape[0] * scale))
+        rgb = cv2.resize(rgb, size, interpolation=cv2.INTER_AREA)
+        mask = cv2.resize(mask.astype('uint8'), size, interpolation=cv2.INTER_NEAREST).astype(bool)
+    if mask.sum() < 100:
+        raise ValueError("Menos de 100 píxeles de objeto; revisar máscara.")
+    Image.fromarray(mask.astype('uint8') * 255).save(dirs['mascaras'] / (image_id + '.png'))
+    overlay = rgb.copy()
+    overlay[~mask] = (0.25 * overlay[~mask] + 0.75 * np.array([180, 180, 180])).astype('uint8')
+    Image.fromarray(overlay).save(dirs['revision'] / (image_id + '.jpg'))
+    return rgb, mask, method, review, scale
+
+
+def analyze(path, image_id, dirs):
+    rgb, mask, method, review, scale = load_mask(path, image_id, dirs)
+    pixels = rgb[mask].astype(float) / 255
+    lab = rgb2lab(pixels.reshape(-1, 1, 3)).reshape(-1, 3)
+    rng = np.random.default_rng(SEMILLA)
+    indices = rng.choice(len(lab), min(len(lab), MAX_PIXELES_ENTRENAMIENTO), replace=False)
+    k = min(K_COLORES, len(np.unique(rgb[mask][indices], axis=0)))
+    model = MiniBatchKMeans(n_clusters=k, random_state=SEMILLA, n_init=5,
+                           batch_size=1024).fit(lab[indices])
+    labels = model.predict(lab)
+    counts = np.bincount(labels, minlength=k)
+    order = np.argsort(-counts)
+    rows, palette = [], []
+    for rank, cluster in enumerate(order, 1):
+        if not counts[cluster]:
+            continue
+        chosen = labels == cluster
+        mean_rgb = pixels[chosen].mean(axis=0) * 255
+        mean_lab = lab[chosen].mean(axis=0)
+        hex_color = '#' + ''.join(f'{v:02X}' for v in np.clip(np.rint(mean_rgb), 0, 255).astype(int))
+        proportion = float(counts[cluster] / len(lab))
+        rows.append({'imagen_id': image_id, 'rango_color': rank,
+                     'R': mean_rgb[0], 'G': mean_rgb[1], 'B': mean_rgb[2],
+                     'L': mean_lab[0], 'a': mean_lab[1], 'b': mean_lab[2],
+                     'Hex': hex_color, 'Proporcion': proportion,
+                     'Porcentaje': proportion * 100, 'pixeles': int(counts[cluster])})
+        palette.append((hex_color, proportion))
+    proportions = np.array([p for _, p in palette])
+    metric = {'imagen_id': image_id, 'metodo_mascara': method, 'revision': review,
+              'referencia_color': 'sRGB_D65_ICC_si_disponible_sRGB_asumido_si_ausente',
+              'alcance_color': 'objeto_visible_incluye_posibles_hojas_y_tallo',
+              'escala_analisis': scale, 'ancho_analisis': rgb.shape[1],
+              'alto_analisis': rgb.shape[0], 'pixeles_objeto': len(lab),
+              'fraccion_objeto': float(mask.mean()), 'k_real': len(rows),
+              'Hex_dominante_R': rows[0]['Hex'],
+              'Proporcion_dominante': rows[0]['Proporcion'],
+              'L_media': lab[:, 0].mean(), 'a_media': lab[:, 1].mean(), 'b_media': lab[:, 2].mean(),
+              'R_media': pixels[:, 0].mean()*255, 'G_media': pixels[:, 1].mean()*255,
+              'B_media': pixels[:, 2].mean()*255,
+              'L_sd': lab[:, 0].std(), 'a_sd': lab[:, 1].std(), 'b_sd': lab[:, 2].std(),
+              'Croma_medio': np.hypot(lab[:, 1], lab[:, 2]).mean(),
+              'Entropia_paleta': float(-np.sum(proportions*np.log2(proportions)))}
+    canvas = Image.new('RGB', (900, 120), 'white')
+    draw, left = ImageDraw.Draw(canvas), 0
+    for i, (color, share) in enumerate(palette):
+        right = 900 if i == len(palette)-1 else left + round(900*share)
+        draw.rectangle([left, 0, right, 85], fill=color)
+        if right-left > 70:
+            draw.text((left+4, 92), f'{color} {share:.1%}', fill='black')
+        left = right
+    canvas.save(dirs['paletas'] / (image_id+'.png'))
+    return metric, rows
+
+
+def main():
+    if not 1 <= K_COLORES <= 20:
+        raise ValueError('K_COLORES debe estar entre 1 y 20.')
+    root = Path(CARPETA_SALIDA)
+    dirs = {name: root/name for name in ['imagenes', 'mascaras', 'mascaras_manuales', 'revision', 'paletas']}
+    for folder in dirs.values():
+        folder.mkdir(parents=True, exist_ok=True)
+    # Cada ejecución reconstruye los CSV; las imágenes existentes se reutilizan.
+    for filename, columns in [
+        ('imagenes_metadata.csv', ['imagen_id','estado_descarga','estado_analisis']),
+        ('metricas_color.csv', ['imagen_id','L_media','a_media','b_media']),
+        ('colores_dominantes.csv', ['imagen_id','Hex','Proporcion']),
+        ('errores.csv', ['etapa','url','error'])]:
+        pd.DataFrame(columns=columns).to_csv(root/filename, index=False, encoding='utf-8-sig')
+    s, errors, records, metrics, colors = session(), [], [], [], []
+    products = discover(s, errors)
+    if not products:
+        save_csv(errors, root/'errores.csv')
+        raise RuntimeError('No se encontraron productos. Consultar errores.csv.')
+    save_csv(products, root/'productos_catalogo.csv')
+    for n, product in enumerate(products, 1):
+        print(f'[{n}/{len(products)}] {product["nombre"]}')
+        try:
+            meta, images = detail(s, product)
+        except Exception as e:
+            errors.append({'etapa': 'ficha', 'url': product['producto_url'], 'error': str(e)})
+            save_csv(errors, root/'errores.csv')
+            continue
+        for i, url in enumerate(images, 1):
+            image_id = slug(meta['nombre']) + '_' + hashlib.sha1(meta['producto_url'].encode()).hexdigest()[:8] + f'_{i:02d}'
+            row = dict(meta, imagen_id=image_id, imagen_url=url, indice_foto=i)
+            try:
+                path, info = download(s, url, image_id, dirs['imagenes'])
+                row.update(info)
+                row['estado_analisis'] = 'NO_SOLICITADO'
+                if ANALIZAR_COLOR:
+                    try:
+                        metric, palette = analyze(path, image_id, dirs)
+                        metrics.append(dict(meta, **metric))
+                        colors.extend(dict(meta, **c) for c in palette)
+                        row['estado_analisis'] = 'ANALIZADA'
+                    except Exception as e:
+                        row['estado_analisis'] = 'ERROR_ANALISIS'
+                        errors.append({'etapa': 'analisis', 'imagen_id': image_id, 'url': url, 'error': str(e)})
+            except Exception as e:
+                row.update(estado_descarga='ERROR_DESCARGA', estado_analisis='NO_ANALIZADA')
+                errors.append({'etapa': 'descarga', 'imagen_id': image_id, 'url': url, 'error': str(e)})
+            records.append(row)
+            save_csv(records, root/'imagenes_metadata.csv')
+            save_csv(metrics, root/'metricas_color.csv')
+            save_csv(colors, root/'colores_dominantes.csv')
+            save_csv(errors, root/'errores.csv')
+    config = {k: str(v) for k,v in globals().items() if k.isupper() and not k.startswith('_')}
+    (root/'configuracion.json').write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding='utf-8')
+    if not errors:
+        pd.DataFrame(columns=['etapa','url','error']).to_csv(root/'errores.csv', index=False)
+    print('\nProceso terminado. Resumen por imagen:')
+    print(pd.DataFrame(records).groupby(['estado_descarga','estado_analisis']).size())
+    print('Productos consultados:', len(products), '| Imágenes analizadas:', len(metrics))
+    print('Errores:', len(errors), '| Salida:', root.resolve())
+    print('Revisar las máscaras antes de interpretar los colores como colores de pétalos.')
+    return pd.DataFrame(records), pd.DataFrame(metrics), pd.DataFrame(colors)
+
+
+if __name__ == '__main__':
+    metadata, metricas, colores = main()
